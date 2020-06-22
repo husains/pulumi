@@ -1472,6 +1472,7 @@ func TestProviderSecretConfig(t *testing.T) {
 
 // Tests dynamic provider in Python.
 func TestDynamicPython(t *testing.T) {
+	t.Skip("Temporarily skipping test - pulumi/pulumi#4849")
 	var randomVal string
 	integration.ProgramTest(t, &integration.ProgramTestOptions{
 		Dir: filepath.Join("dynamic", "python"),
@@ -1508,6 +1509,31 @@ func TestDynamicPythonVenv(t *testing.T) {
 			Additive: true,
 			ExtraRuntimeValidation: func(t *testing.T, stack integration.RuntimeValidationStackInfo) {
 				assert.Equal(t, randomVal, stack.Outputs["random_val"].(string))
+			},
+		}},
+		UseAutomaticVirtualEnv: true,
+	})
+}
+
+// Tests dynamic provider in Python using input/output types.
+func TestDynamicPythonTypes(t *testing.T) {
+	var randomVal string
+	var randomSize float64
+	integration.ProgramTest(t, &integration.ProgramTestOptions{
+		Dir: filepath.Join("dynamic", "python_types"),
+		Dependencies: []string{
+			filepath.Join("..", "..", "sdk", "python", "env", "src"),
+		},
+		ExtraRuntimeValidation: func(t *testing.T, stack integration.RuntimeValidationStackInfo) {
+			randomVal = stack.Outputs["random_val"].(string)
+			randomSize = stack.Outputs["random_size"].(float64)
+		},
+		EditDirs: []integration.EditDir{{
+			Dir:      "step1",
+			Additive: true,
+			ExtraRuntimeValidation: func(t *testing.T, stack integration.RuntimeValidationStackInfo) {
+				assert.Equal(t, randomVal, stack.Outputs["random_val"].(string))
+				assert.Equal(t, randomSize, stack.Outputs["random_size"].(float64))
 			},
 		}},
 		UseAutomaticVirtualEnv: true,

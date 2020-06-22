@@ -71,6 +71,12 @@ from .output import (
     Inputs,
     UNKNOWN,
     contains_unknowns,
+    MISSING,
+    Property,
+    input_property,
+    input_type,
+    output_property,
+    output_type,
 )
 
 from .log import (

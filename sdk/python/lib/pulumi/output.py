@@ -15,6 +15,7 @@ import asyncio
 from functools import reduce
 from inspect import isawaitable
 from typing import (
+    Type,
     TypeVar,
     Generic,
     Set,
@@ -23,10 +24,11 @@ from typing import (
     Union,
     cast,
     Mapping,
+    Dict,
     Any,
     List,
     Optional,
-    TYPE_CHECKING
+    TYPE_CHECKING,
 )
 
 from . import runtime
@@ -385,3 +387,179 @@ UNKNOWN is the singleton unknown value.
 
 def contains_unknowns(val: Any) -> bool:
     return rpc.contains_unknowns(val)
+
+
+_PULUMI_INPUT_TYPE = "_pulumi_input_type"
+_PULUMI_OUTPUT_TYPE = "_pulumi_output_type"
+_PULUMI_PROPERTIES = "_pulumi_properties"
+_TO_DICT = "_to_dict"
+_TRANSLATE_PROPERTY = "_translate_property"
+_VALUES = "_values"
+
+
+class _MISSING_TYPE:
+    pass
+MISSING = _MISSING_TYPE()
+"""
+MISSING is a singleton sentinel object to detect if a parameter is supplied or not.
+"""
+
+class Property:
+    """
+    Represents a Pulumi property. It is not meant to be created outside this module,
+    rather, the input_property() and output_property() functions should be used.
+    """
+    def __init__(self, name: str, default: Any = MISSING) -> None:
+        self.name = name
+        self.default = default
+        self.type: Any = None
+
+
+def input_property(name: str, default: Any = MISSING):
+    """
+    Return an object to identify Pulumi input properties.
+
+    name is the Pulumi property name.
+    default is the default value of the property.
+    """
+    return Property(name, default)
+
+
+def output_property(name: str):
+    """
+    Return an object to identify Pulumi output properties.
+
+    name is the Pulumi property name.
+    """
+    return Property(name)
+
+
+def _get_properties(cls: type) -> Dict[str, Property]:
+    """
+    Returns a dictionary of properties from annotations defined on the class.
+    """
+
+    # Get annotations that are defined on this class (not base classes).
+    cls_annotations = cls.__dict__.get('__annotations__', {})
+
+    def get_property(cls: type, a_name: str, a_type: Any) -> Property:
+        default = getattr(cls, a_name, MISSING)
+        p = default if isinstance(default, Property) else Property(name=a_name, default=default)
+        p.type = a_type
+        return p
+
+    return {
+        name: get_property(cls, name, type)
+        for name, type in cls_annotations.items()
+    }
+
+
+def _process_class(cls: type, signifier_attr: str) -> Dict[str, Any]:
+    # Get properties.
+    props = _get_properties(cls)
+
+    # Clean-up class attributes.
+    for name, prop in props.items():
+        # If the class attribute (which is the default value for this
+        # prop) exists and is of type 'Property', replace it with the
+        # real default. This is so that normal class introspection
+        # sees a real default value, not a Property.
+        if isinstance(getattr(cls, name, None), Property):
+            if prop.default is not MISSING:
+                # If there's no default, delete the class attribute so
+                # that it is not set at all in the post-processed class.
+                delattr(cls, name)
+            else:
+                setattr(cls, name, prop.default)
+
+    # Mark this class with the signifier and save the properties.
+    setattr(cls, signifier_attr, True)
+    setattr(cls, _PULUMI_PROPERTIES, props)
+
+    return props
+
+
+def _create_py_property(cls: type, a_name: str, pulumi_name: str, translate):
+    """
+    Returns Python property getter that looks up the value in a dict.
+    """
+
+    # If the class itself is a subclass of dict, get the value from itself,
+    # otherwise, get the value from a private _values attribute.
+    if issubclass(cls, dict):
+        def getter(self):
+            # Grab dict's `get` method instead of calling `self.get` directly
+            # in case the type has a `get` property.
+            return getattr(dict, "get")(self, translate(self, pulumi_name))
+    else:
+        def getter(self):
+            return getattr(self, _VALUES).get(translate(self, pulumi_name))
+
+    getter.__name__ = a_name
+    return property(getter)
+
+
+def input_type(cls: Type[T]) -> Type[T]:
+    """
+    Returns the same class as was passed in, but marked as an input type.
+    """
+
+    # Get the input properties and mark the class as an input type.
+    props = _process_class(cls, _PULUMI_INPUT_TYPE)
+
+    # Add a _to_dict func, if needed.
+    if not hasattr(cls, _TO_DICT):
+        _translate_property = getattr(cls, _TRANSLATE_PROPERTY, None)
+        if callable(_translate_property):
+            def _to_dict(self) -> dict:
+                # Return a copy of `self.__dict__` with translated keys.
+                return {
+                    _translate_property(self, props[k].name if k in props else k): v
+                    for k, v in self.__dict__.items()
+                }
+        else:
+            def _to_dict(self) -> dict:
+                # Return a copy of `self.__dict__`.
+                return {
+                    props[k].name if k in props else k: v
+                    for k, v in self.__dict__.items()
+                }
+        setattr(cls, _TO_DICT, _to_dict)
+    return cls
+
+
+def output_type(cls: Type[T]) -> Type[T]:
+    """
+    Returns the same class as was passed in, but marked as an output type.
+
+    Python property getters are created for each Pulumi output property
+    defined in the class.
+
+    If the class is not a subclass of dict and doesn't have an __init__()
+    method, an __init__() method is added to the class that accepts a dict
+    representing the outputs.
+    """
+
+    # Get the output properties and mark the class as an output type.
+    props = _process_class(cls, _PULUMI_OUTPUT_TYPE)
+
+    # Add an __init__() method that takes a dict (representing outputs) as an arg
+    # if the class isn't a subclass of dict and doesn't have an __init__() method.
+    if not issubclass(cls, dict) and "__init__" not in cls.__dict__:
+        def init(self, value: dict) -> None:
+            if not isinstance(value, dict):
+                raise TypeError('Expected value to be a dict')
+            setattr(self, _VALUES, value)
+        setattr(cls, "__init__", init)
+
+    # If the class has a _translate_property() method, use it to translate
+    # property names, otherwise, use an identity function.
+    translate = getattr(cls, _TRANSLATE_PROPERTY, None)
+    if not callable(translate):
+        translate = lambda self, prop: prop
+
+    # Create Python properties that get the value from the dictionary.
+    for name, prop in props.items():
+        setattr(cls, name, _create_py_property(cls, name, prop.name, translate))
+
+    return cls
