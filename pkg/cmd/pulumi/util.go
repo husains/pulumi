@@ -114,11 +114,7 @@ func commandContext() context.Context {
 	return ctx
 }
 
-// createStack creates a stack with the given name, and optionally selects it as the current.
-func createStack(
-	b backend.Backend, stackRef backend.StackReference, opts interface{}, setCurrent bool,
-	secretsProvider string) (backend.Stack, error) {
-
+func createSecretsManager(b backend.Backend, stackRef backend.StackReference, secretsProvider string) error {
 	// As part of creating the stack, we also need to configure the secrets provider for the stack.
 	// We need to do this configuration step for cases where we will be using with the passphrase
 	// secrets provider or one of the cloud-backed secrets providers.  We do not need to do this
@@ -128,9 +124,10 @@ func createStack(
 		// The default when using the filestate backend is the passphrase secrets provider
 		secretsProvider = passphrase.Type
 	}
+
 	if secretsProvider == passphrase.Type {
 		if _, pharseErr := newPassphraseSecretsManager(stackRef.Name(), stackConfigFile); pharseErr != nil {
-			return nil, pharseErr
+			return pharseErr
 		}
 	} else if !isDefaultSecretsProvider {
 		// All other non-default secrets providers are handled by the cloud secrets provider which
@@ -141,7 +138,7 @@ func createStack(
 		if strings.HasPrefix(secretsProvider, "azurekeyvault://") {
 			parsed, err := url.Parse(secretsProvider)
 			if err != nil {
-				return nil, errors.Wrap(err, "failed to parse secrets provider URL")
+				return errors.Wrap(err, "failed to parse secrets provider URL")
 			}
 
 			if parsed.Query().Get("algorithm") == "" {
@@ -151,8 +148,20 @@ func createStack(
 		}
 
 		if _, secretsErr := newCloudSecretsManager(stackRef.Name(), stackConfigFile, secretsProvider); secretsErr != nil {
-			return nil, secretsErr
+			return secretsErr
 		}
+	}
+
+	return nil
+}
+
+// createStack creates a stack with the given name, and optionally selects it as the current.
+func createStack(
+	b backend.Backend, stackRef backend.StackReference, opts interface{}, setCurrent bool,
+	secretsProvider string) (backend.Stack, error) {
+
+	if err := createSecretsManager(b, stackRef, secretsProvider); err != nil {
+		return nil, err
 	}
 
 	stack, err := b.CreateStack(commandContext(), stackRef, opts)

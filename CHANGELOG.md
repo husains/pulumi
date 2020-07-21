@@ -11,6 +11,9 @@ CHANGELOG
 
 - Add logic to parse pulumi venv on github action
   [#4994](https://github.com/pulumi/pulumi/pull/4994)
+  
+- Add ability to change a secrets provider for the current stack
+  [#5030](https://github.com/pulumi/pulumi/pull/5030)
 
 ## 2.6.1 (2020-07-09)
 
