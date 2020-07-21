@@ -20,6 +20,9 @@ CHANGELOG
 - Output PDB files and enable SourceLink integration for .NET assemblies
   [#4967](https://github.com/pulumi/pulumi/pull/4967)
 
+- SDK changes to support Python input/output classes
+  [#5033](https://github.com/pulumi/pulumi/pull/5033)
+
 ## 2.6.1 (2020-07-09)
 
 - Fix a panic in the display during CLI operations
