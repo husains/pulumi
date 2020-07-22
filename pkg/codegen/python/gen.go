@@ -291,12 +291,33 @@ func (mod *modContext) gen(fs fs) error {
 
 	// Nested types
 	if len(mod.types) > 0 {
-		mod.genTypes(dir, fs)
+		if err := mod.genTypes(dir, fs); err != nil {
+			return err
+		}
 	}
 
 	// Index
-	fs.add(path.Join(dir, "__init__.py"), []byte(mod.genInit(exports)))
+	if !mod.isEmpty() {
+		fs.add(path.Join(dir, "__init__.py"), []byte(mod.genInit(exports)))
+	}
+
 	return nil
+}
+
+func (mod *modContext) isEmpty() bool {
+	var any func(m *modContext) bool
+	any = func(m *modContext) bool {
+		if len(m.extraSourceFiles) > 0 || len(m.functions) > 0 || len(m.resources) > 0 || len(m.types) > 0 {
+			return true
+		}
+		for _, child := range m.children {
+			if any(child) {
+				return true
+			}
+		}
+		return false
+	}
+	return !any(mod)
 }
 
 func (mod *modContext) submodulesExist() bool {
@@ -339,6 +360,10 @@ func (mod *modContext) genInit(exports []string) string {
 		fmt.Fprintf(w, "\n# Make subpackages available:\n")
 		fmt.Fprintf(w, "from . import (\n")
 		for _, mod := range mod.children {
+			if mod.isEmpty() {
+				continue
+			}
+
 			child := mod.mod
 			if mod.compatibility == kubernetes20 {
 				// Extract version suffix from child modules. Nested versions will have their own __init__.py file.
@@ -384,7 +409,7 @@ func (mod *modContext) genConfig(variables []*schema.Property) (string, error) {
 }
 
 func (mod *modContext) genTypes(dir string, fs fs) error {
-	genTypes := func(input bool) ([]byte, error) {
+	genTypes := func(file string, input bool) error {
 		w := &bytes.Buffer{}
 
 		mod.genHeader(w, true, false)
@@ -393,28 +418,24 @@ func (mod *modContext) genTypes(dir string, fs fs) error {
 			if input && mod.details(t).inputType {
 				wrapInput := !mod.details(t).functionType
 				if err := mod.genType(w, tokenToName(t.Token), t.Comment, t.Properties, true, wrapInput); err != nil {
-					return nil, err
+					return err
 				}
 			}
 			if !input && mod.details(t).outputType {
 				if err := mod.genType(w, tokenToName(t.Token), t.Comment, t.Properties, false, false); err != nil {
-					return nil, err
+					return err
 				}
 			}
 		}
-
-		return w.Bytes(), nil
+		fs.add(path.Join(dir, file), w.Bytes())
+		return nil
 	}
-	inputs, err := genTypes(true)
-	if err != nil {
+	if err := genTypes("_inputs.py", true); err != nil {
 		return err
 	}
-	outputs, err := genTypes(false)
-	if err != nil {
+	if err := genTypes("outputs.py", false); err != nil {
 		return err
 	}
-	fs.add(path.Join(dir, "_inputs.py"), inputs)
-	fs.add(path.Join(dir, "outputs.py"), outputs)
 	return nil
 }
 
@@ -1634,7 +1655,10 @@ func generateModuleContextMap(tool string, pkg *schema.Package, info PackageInfo
 	for _, t := range pkg.Types {
 		if obj, ok := t.(*schema.ObjectType); ok {
 			mod := getModFromToken(obj.Token)
-			mod.types = append(mod.types, obj)
+			d := mod.details(obj)
+			if d.inputType || d.outputType {
+				mod.types = append(mod.types, obj)
+			}
 		}
 	}
 
