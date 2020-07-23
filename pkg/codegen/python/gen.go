@@ -103,25 +103,49 @@ func (mod *modContext) tokenToType(tok string, input bool) string {
 	components := strings.Split(tok, ":")
 	contract.Assertf(len(components) == 3, "malformed token %v", tok)
 
-	name := title(components[2])
-
-	var root string
-	if !input {
-		root = "outputs."
-	}
+	modName, name := mod.tokenToModule(tok), title(components[2])
 
 	var suffix string
 	if input {
 		suffix = "Args"
 	}
 
-	return fmt.Sprintf("'%s%s%s'", root, name, suffix)
+	if modName == "" && modName != mod.mod {
+		rootModName := "_root_outputs."
+		if input {
+			rootModName = "_root_inputs."
+		}
+		return fmt.Sprintf("'%s%s%s'", rootModName, name, suffix)
+	}
+
+	if modName == mod.mod {
+		modName = ""
+	}
+	if modName != "" {
+		modName = "_" + strings.ReplaceAll(modName, "/", ".") + "."
+	}
+
+	var prefix string
+	if !input {
+		prefix = "outputs."
+	}
+
+	return fmt.Sprintf("'%s%s%s%s'", modName, prefix, name, suffix)
 }
 
 func tokenToName(tok string) string {
 	components := strings.Split(tok, ":")
 	contract.Assertf(len(components) == 3, "malformed token %v", tok)
 	return title(components[2])
+}
+
+func (mod *modContext) tokenToModule(tok string) string {
+	canonicalModName := mod.pkg.TokenToModule(tok)
+	modName := PyName(strings.ToLower(canonicalModName))
+	if override, ok := mod.modNameOverrides[canonicalModName]; ok {
+		modName = override
+	}
+	return modName
 }
 
 func printComment(w io.Writer, comment string, indent string) {
@@ -146,7 +170,7 @@ func printComment(w io.Writer, comment string, indent string) {
 	fmt.Fprintf(w, "%s\"\"\"\n", indent)
 }
 
-func (mod *modContext) genHeader(w io.Writer, needsSDK bool, needsJSON bool) {
+func (mod *modContext) genHeader(w io.Writer, needsSDK, needsJSON bool, imports stringSet) {
 	// Set the encoding to UTF-8, in case the comments contain non-ASCII characters.
 	fmt.Fprintf(w, "# coding=utf-8\n")
 
@@ -171,9 +195,13 @@ func (mod *modContext) genHeader(w io.Writer, needsSDK bool, needsJSON bool) {
 		fmt.Fprintf(w, "import pulumi.runtime\n")
 		fmt.Fprintf(w, "from typing import Any, Dict, List, Optional, Tuple, Union\n")
 		fmt.Fprintf(w, "from %s import _utilities, _tables\n", relImport)
-		if len(mod.types) > 0 {
-			fmt.Fprintf(w, "from ._inputs import *\n")
-			fmt.Fprintf(w, "from . import outputs\n")
+		var sortedImports []string
+		for imp := range imports {
+			sortedImports = append(sortedImports, imp)
+		}
+		sort.Strings(sortedImports)
+		for _, imp := range sortedImports {
+			fmt.Fprintf(w, "%s\n", imp)
 		}
 		fmt.Fprintf(w, "\n")
 	}
@@ -228,7 +256,7 @@ func (mod *modContext) gen(fs fs) error {
 	switch mod.mod {
 	case "":
 		buffer := &bytes.Buffer{}
-		mod.genHeader(buffer, false, false)
+		mod.genHeader(buffer, false, false, nil)
 		fmt.Fprintf(buffer, "%s", utilitiesFile)
 		fs.add(filepath.Join(dir, "_utilities.py"), buffer.Bytes())
 		fs.add(filepath.Join(dir, "py.typed"), []byte{})
@@ -304,6 +332,18 @@ func (mod *modContext) gen(fs fs) error {
 	return nil
 }
 
+func (mod *modContext) hasTypes(input bool) bool {
+	for _, t := range mod.types {
+		if input && mod.details(t).inputType {
+			return true
+		}
+		if !input && mod.details(t).outputType {
+			return true
+		}
+	}
+	return false
+}
+
 func (mod *modContext) isEmpty() bool {
 	var any func(m *modContext) bool
 	any = func(m *modContext) bool {
@@ -327,7 +367,7 @@ func (mod *modContext) submodulesExist() bool {
 // genInit emits an __init__.py module, optionally re-exporting other members or submodules.
 func (mod *modContext) genInit(exports []string) string {
 	w := &bytes.Buffer{}
-	mod.genHeader(w, false, false)
+	mod.genHeader(w, false, false, nil)
 
 	// Import anything to export flatly that is a direct export rather than sub-module.
 	if len(exports) > 0 {
@@ -346,8 +386,10 @@ func (mod *modContext) genInit(exports []string) string {
 			fmt.Fprintf(w, "from .%s import *\n", name)
 		}
 	}
-	if len(mod.types) > 0 {
+	if mod.hasTypes(true /*input*/) {
 		fmt.Fprintf(w, "from ._inputs import *\n")
+	}
+	if mod.hasTypes(false /*input*/) {
 		fmt.Fprintf(w, "from . import outputs\n")
 	}
 
@@ -380,10 +422,47 @@ func (mod *modContext) genInit(exports []string) string {
 	return w.String()
 }
 
+func (mod *modContext) importFromToken(tok string, input bool) string {
+	modName := mod.tokenToModule(tok)
+	if modName == mod.mod {
+		if input {
+			return "from ._inputs import *"
+		}
+		return "from . import outputs"
+	}
+
+	rel, err := filepath.Rel(mod.mod, "")
+	contract.Assert(err == nil)
+	relRoot := path.Dir(rel)
+	relImport := relPathToRelImport(relRoot)
+
+	if modName == "" {
+		imp, as := "outputs", "_root_outputs"
+		if input {
+			imp, as = "_inputs", "_root_inputs"
+		}
+		return fmt.Sprintf("from %s import %s as %s", relImport, imp, as)
+	}
+
+	components := strings.Split(modName, "/")
+	return fmt.Sprintf("from %s import %[2]s as _%[2]s", relImport, components[0])
+}
+
 // emitConfigVariables emits all config vaiables in the given module, returning the resulting file.
 func (mod *modContext) genConfig(variables []*schema.Property) (string, error) {
 	w := &bytes.Buffer{}
-	mod.genHeader(w, true, false)
+
+	imports := stringSet{}
+	outputSeen := codegen.Set{}
+	for _, p := range variables {
+		visitObjectTypes(p.Type, func(t *schema.ObjectType) {
+			if imp := mod.importFromToken(t.Token, false); imp != "" {
+				imports.add(imp)
+			}
+		}, outputSeen)
+	}
+
+	mod.genHeader(w, true, false, imports)
 
 	// Create a config bag for the variables to pull from.
 	fmt.Fprintf(w, "__config__ = pulumi.Config('%s')\n", mod.pkg.Name)
@@ -412,22 +491,55 @@ func (mod *modContext) genTypes(dir string, fs fs) error {
 	genTypes := func(file string, input bool) error {
 		w := &bytes.Buffer{}
 
-		mod.genHeader(w, true, false)
+		imports := stringSet{}
+		addImport := func(tok string, input bool) {
+			if imp := mod.importFromToken(tok, input); imp != "" {
+				if (input && imp == "from ._inputs import *") || (!input && imp == "from . import outputs") {
+					return
+				}
+				imports.add(imp)
+			}
+		}
+		inputSeen := codegen.Set{}
+		outputSeen := codegen.Set{}
+		for _, t := range mod.types {
+			if input && mod.details(t).inputType {
+				for _, p := range t.Properties {
+					visitObjectTypes(p.Type, func(t *schema.ObjectType) {
+						addImport(t.Token, true /*input*/)
+					}, inputSeen)
+				}
+			}
+			if !input && mod.details(t).outputType {
+				for _, p := range t.Properties {
+					visitObjectTypes(p.Type, func(t *schema.ObjectType) {
+						addImport(t.Token, false /*input*/)
+					}, outputSeen)
+				}
+			}
+		}
 
+		mod.genHeader(w, true, false, imports)
+
+		var hasTypes bool
 		for _, t := range mod.types {
 			if input && mod.details(t).inputType {
 				wrapInput := !mod.details(t).functionType
 				if err := mod.genType(w, tokenToName(t.Token), t.Comment, t.Properties, true, wrapInput); err != nil {
 					return err
 				}
+				hasTypes = true
 			}
 			if !input && mod.details(t).outputType {
 				if err := mod.genType(w, tokenToName(t.Token), t.Comment, t.Properties, false, false); err != nil {
 					return err
 				}
+				hasTypes = true
 			}
 		}
-		fs.add(path.Join(dir, file), w.Bytes())
+		if hasTypes {
+			fs.add(path.Join(dir, file), w.Bytes())
+		}
 		return nil
 	}
 	if err := genTypes("_inputs.py", true); err != nil {
@@ -519,7 +631,34 @@ func jsonImportRequired(res *schema.Resource) bool {
 
 func (mod *modContext) genResource(res *schema.Resource) (string, error) {
 	w := &bytes.Buffer{}
-	mod.genHeader(w, true, jsonImportRequired(res))
+
+	imports := stringSet{}
+	addImport := func(tok string, input bool) {
+		if imp := mod.importFromToken(tok, input); imp != "" {
+			imports.add(imp)
+		}
+	}
+	inputSeen := codegen.Set{}
+	outputSeen := codegen.Set{}
+	for _, p := range res.Properties {
+		visitObjectTypes(p.Type, func(t *schema.ObjectType) {
+			addImport(t.Token, false /*input*/)
+		}, outputSeen)
+	}
+	for _, p := range res.InputProperties {
+		visitObjectTypes(p.Type, func(t *schema.ObjectType) {
+			addImport(t.Token, !res.IsProvider)
+		}, inputSeen)
+	}
+	if res.StateInputs != nil {
+		for _, p := range res.StateInputs.Properties {
+			visitObjectTypes(p.Type, func(t *schema.ObjectType) {
+				addImport(t.Token, true /*input*/)
+			}, inputSeen)
+		}
+	}
+
+	mod.genHeader(w, true, jsonImportRequired(res), imports)
 
 	baseType := "pulumi.CustomResource"
 	if res.IsProvider {
@@ -757,7 +896,31 @@ func (mod *modContext) writeAlias(w io.Writer, alias *schema.Alias) {
 
 func (mod *modContext) genFunction(fun *schema.Function) (string, error) {
 	w := &bytes.Buffer{}
-	mod.genHeader(w, true, false)
+
+	imports := stringSet{}
+	addImport := func(tok string, input bool) {
+		if imp := mod.importFromToken(tok, input); imp != "" {
+			imports.add(imp)
+		}
+	}
+	inputSeen := codegen.Set{}
+	outputSeen := codegen.Set{}
+	if fun.Inputs != nil {
+		for _, p := range fun.Inputs.Properties {
+			visitObjectTypes(p.Type, func(t *schema.ObjectType) {
+				addImport(t.Token, true /*input*/)
+			}, inputSeen)
+		}
+	}
+	if fun.Outputs != nil {
+		for _, p := range fun.Outputs.Properties {
+			visitObjectTypes(p.Type, func(t *schema.ObjectType) {
+				addImport(t.Token, false /*input*/)
+			}, outputSeen)
+		}
+	}
+
+	mod.genHeader(w, true, false, imports)
 
 	name := PyName(tokenToName(fun.Token))
 
@@ -885,7 +1048,7 @@ func sanitizePackageDescription(description string) string {
 // genPackageMetadata generates all the non-code metadata required by a Pulumi package.
 func genPackageMetadata(tool string, pkg *schema.Package, requires map[string]string) (string, error) {
 	w := &bytes.Buffer{}
-	(&modContext{tool: tool}).genHeader(w, false, false)
+	(&modContext{tool: tool}).genHeader(w, false, false, nil)
 
 	// Now create a standard Python package from the metadata.
 	fmt.Fprintf(w, "import errno\n")
@@ -1035,7 +1198,7 @@ func pep440VersionToSemver(v string) (semver.Version, error) {
 // used to convert to and from snake case and camel case.
 func (mod *modContext) genPropertyConversionTables() string {
 	w := &bytes.Buffer{}
-	mod.genHeader(w, false, false)
+	mod.genHeader(w, false, false, nil)
 
 	var allKeys []string
 	for key := range mod.snakeCaseToCamelCase {
